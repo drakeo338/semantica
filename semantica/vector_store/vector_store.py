@@ -860,6 +860,11 @@ class VectorStore:
             else:
                 raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have update or update_vectors method")
 
+            # A backend that rejects the update keeps its old values, so
+            # leave the mirror untouched and pass the result through.
+            if result is False:
+                return result
+
             # Keep the facade mirror in step with the backend, as
             # delete_vectors does, so save() persists the updated values.
             with self._inmemory_lock:
