@@ -648,9 +648,19 @@ class CentralityCalculator:
             col_indices = []
             data = []
             
+            # A plain graph dictionary has its adjacency built once for the
+            # whole loop rather than once per node.
+            adjacency = (
+                build_adjacency(graph, directed=True)
+                if isinstance(graph, dict)
+                else None
+            )
+
             for node in nodes:
                 source_idx = node_index[node]
-                neighbors = self._get_filtered_neighbors(graph, node, relationship_types)
+                neighbors = self._get_filtered_neighbors(
+                    graph, node, relationship_types, adjacency=adjacency
+                )
                 
                 # Distribute PageRank equally among neighbors
                 if neighbors:
@@ -716,14 +726,21 @@ class CentralityCalculator:
         self, 
         graph: Any, 
         node: str, 
-        relationship_types: Optional[List[str]]
+        relationship_types: Optional[List[str]],
+        adjacency: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
-        """Get neighbors filtered by relationship types."""
+        """Get neighbors filtered by relationship types.
+
+        ``adjacency`` is an optional prebuilt outgoing adjacency for a plain
+        graph dictionary, so a caller looping over nodes builds it once.
+        """
         if isinstance(graph, dict):
             # A plain graph dictionary has no neighbour walk of its own, so the
             # outgoing adjacency comes from the same dict-aware builder the rest
             # of the analytics use.
-            neighbors = build_adjacency(graph, directed=True).get(node, [])
+            if adjacency is None:
+                adjacency = build_adjacency(graph, directed=True)
+            neighbors = adjacency.get(node, [])
         elif hasattr(graph, 'neighbors'):
             _raw = list(graph.neighbors(node))
             neighbors = [n.get("id") if isinstance(n, dict) else n for n in _raw]
