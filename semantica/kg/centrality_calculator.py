@@ -590,7 +590,7 @@ class CentralityCalculator:
         graph: Any,
         node_labels: Optional[List[str]] = None,
         relationship_types: Optional[List[str]] = None,
-        max_iterations: int = 20,
+        max_iterations: int = 100,
         damping_factor: float = 0.85,
         tolerance: float = 1e-6,
         # Aliases used by some callers
@@ -609,7 +609,13 @@ class CentralityCalculator:
                 ``{"entities": [...], "relationships": [...]}`` mapping)
             node_labels: List of node labels to include (None for all)
             relationship_types: List of relationship types to consider (None for all)
-            max_iterations: Maximum number of iterations for convergence
+            max_iterations: Maximum power-iteration steps. 20 is enough for small
+                undirected graphs, but a directed graph with sink nodes needs far
+                more before the per-node values settle (at tolerance=1e-6 a
+                10-node directed chain needs ~33 steps and a 10-leaf directed
+                star ~85). The default of 100 lets those graphs converge without
+                the caller raising the cap. The scores always sum to 1 whether or
+                not convergence was reached.
             damping_factor: Probability of continuing random walk (0.85 is typical)
             tolerance: Convergence tolerance for PageRank values
             
@@ -647,20 +653,35 @@ class CentralityCalculator:
             row_indices = []
             col_indices = []
             data = []
+            has_outgoing = np.zeros(n, dtype=bool)
             
+            # A plain graph dictionary has its adjacency built once for the
+            # whole loop rather than once per node.
+            adjacency = (
+                build_adjacency(graph, directed=True)
+                if isinstance(graph, dict)
+                else None
+            )
+
             for node in nodes:
                 source_idx = node_index[node]
-                neighbors = self._get_filtered_neighbors(graph, node, relationship_types)
+                neighbors = self._get_filtered_neighbors(
+                    graph, node, relationship_types, adjacency=adjacency
+                )
                 
-                # Distribute PageRank equally among neighbors
-                if neighbors:
-                    weight = 1.0 / len(neighbors)
-                    for neighbor in neighbors:
-                        if neighbor in node_index:  # Only include filtered nodes
-                            target_idx = node_index[neighbor]
-                            row_indices.append(target_idx)
-                            col_indices.append(source_idx)
-                            data.append(weight)
+                # Distribute PageRank equally among the neighbours that survive
+                # the node filter. Counting the filtered-out ones too would send
+                # part of the mass to nodes outside the matrix, where it vanishes
+                # (issue #1759).
+                retained = [n for n in neighbors if n in node_index]
+                if retained:
+                    weight = 1.0 / len(retained)
+                    for neighbour in retained:
+                        target_idx = node_index[neighbour]
+                        row_indices.append(target_idx)
+                        col_indices.append(source_idx)
+                        data.append(weight)
+                        has_outgoing[source_idx] = True
             
             # Create sparse matrix
             adjacency = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
@@ -672,8 +693,19 @@ class CentralityCalculator:
             for iteration in range(max_iterations):
                 prev_pagerank = pagerank.copy()
                 
-                # PageRank formula: PR = (1 - d) * 1/n + d * A * PR
-                pagerank = (1 - damping_factor) / n + damping_factor * adjacency.dot(prev_pagerank)
+                # A node with no outgoing edge inside the current node set (a
+                # leaf, or a node whose neighbours were filtered out) has an
+                # empty column in the transition matrix, so its mass cannot
+                # flow on. Redistribute it uniformly, as standard PageRank does,
+                # otherwise the scores drift below 1 on a directed graph.
+                dangling_mass = prev_pagerank[~has_outgoing].sum()
+
+                # PageRank formula: PR = (1 - d) / n + d * A * PR + d * dangling / n
+                pagerank = (
+                    (1 - damping_factor) / n
+                    + damping_factor * adjacency.dot(prev_pagerank)
+                    + damping_factor * dangling_mass / n
+                )
                 
                 # Check convergence
                 diff = np.linalg.norm(pagerank - prev_pagerank)
@@ -716,14 +748,21 @@ class CentralityCalculator:
         self, 
         graph: Any, 
         node: str, 
-        relationship_types: Optional[List[str]]
+        relationship_types: Optional[List[str]],
+        adjacency: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
-        """Get neighbors filtered by relationship types."""
+        """Get neighbors filtered by relationship types.
+
+        ``adjacency`` is an optional prebuilt outgoing adjacency for a plain
+        graph dictionary, so a caller looping over nodes builds it once.
+        """
         if isinstance(graph, dict):
             # A plain graph dictionary has no neighbour walk of its own, so the
             # outgoing adjacency comes from the same dict-aware builder the rest
             # of the analytics use.
-            neighbors = build_adjacency(graph, directed=True).get(node, [])
+            if adjacency is None:
+                adjacency = build_adjacency(graph, directed=True)
+            neighbors = adjacency.get(node, [])
         elif hasattr(graph, 'neighbors'):
             _raw = list(graph.neighbors(node))
             neighbors = [n.get("id") if isinstance(n, dict) else n for n in _raw]
